@@ -51,6 +51,7 @@ static int kcmp(pid_t pid1, pid_t pid2, int type,
 #include "libsmartcols.h"
 
 #include "lsfd.h"
+#include "lsfd-filter.h"
 
 /*
  * /proc/$pid/mountinfo entries
@@ -182,6 +183,8 @@ struct lsfd_control {
 			json : 1,
 			notrunc : 1,
 			threads : 1;
+
+	struct lsfd_filter *filter;
 };
 
 static int column_name_to_id(const char *name, size_t namesz)
@@ -199,6 +202,11 @@ static int column_name_to_id(const char *name, size_t namesz)
 	return -1;
 }
 
+static int column_name_to_id_cb(const char *name, void *data __attribute__((__unused__)))
+{
+	return column_name_to_id(name, strlen(name));
+}
+
 static int get_column_id(int num)
 {
 	assert(num >= 0);
@@ -211,6 +219,38 @@ static int get_column_id(int num)
 static const struct colinfo *get_column_info(int num)
 {
 	return &infos[ get_column_id(num) ];
+}
+
+static struct libscols_column *add_column(struct libscols_table *tb, const struct colinfo *col)
+{
+	struct libscols_column *cl;
+	int flags = col->flags;
+
+	cl = scols_table_new_column(tb, col->name, col->whint, flags);
+	if (cl)
+		scols_column_set_json_type(cl, col->json_type);
+
+	return cl;
+}
+
+static struct libscols_column *add_column_by_id_cb(struct libscols_table *tb, int colid, void *data)
+{
+	if (ncolumns >= ARRAY_SIZE(columns))
+		errx(EXIT_FAILURE, _("too many columns are added via filter expression"));
+
+	assert(colid < LSFD_N_COLS);
+
+	struct libscols_column *cl = add_column(tb, infos + colid);
+	if (!cl)
+		err(EXIT_FAILURE, _("failed to allocate output column"));
+	columns[ncolumns++] = colid;
+
+	if (colid == COL_TID) {
+		struct lsfd_control *ctl = data;
+		ctl->threads = 1;
+	}
+
+	return cl;
 }
 
 static const struct file_class *stat2class(struct stat *sb)
@@ -668,6 +708,9 @@ static void convert(struct list_head *procs, struct lsfd_control *ctl)
 			if (!ln)
 				err(EXIT_FAILURE, _("failed to allocate output line"));
 			convert1(proc, file, ln);
+
+			if (!lsfd_filter_apply(ctl->filter, ln))
+				scols_table_remove_line(ctl->tb, ln);
 		}
 	}
 }
@@ -677,6 +720,7 @@ static void delete(struct list_head *procs, struct lsfd_control *ctl)
 	list_free(procs, struct proc, procs, free_proc);
 
 	scols_unref_table(ctl->tb);
+	lsfd_filter_free(ctl->filter);
 }
 
 static void emit(struct lsfd_control *ctl)
@@ -902,6 +946,8 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -r, --raw             use raw output format\n"), out);
 	fputs(_("     --sysroot <dir>   use specified directory as system root\n"), out);
 	fputs(_(" -u, --notruncate      don't truncate text in columns\n"), out);
+	fputs(_(" -Q, --filter <expr>   apply display filter\n"), out);
+	fputs(_("     --source <source> add filter by SOURCE\n"), out);
 
 	fputs(USAGE_SEPARATOR, out);
 	printf(USAGE_HELP_OPTIONS(23));
@@ -909,11 +955,64 @@ static void __attribute__((__noreturn__)) usage(void)
 	fprintf(out, USAGE_COLUMNS);
 
 	for (i = 0; i < ARRAY_SIZE(infos); i++)
-		fprintf(out, " %11s  %s\n", infos[i].name, _(infos[i].help));
+		fprintf(out, " %11s  %-10s%s\n", infos[i].name,
+			infos[i].json_type == SCOLS_JSON_STRING?  "<string>":
+			infos[i].json_type == SCOLS_JSON_NUMBER?  "<number>":
+			"<boolean>",
+			_(infos[i].help));
 
 	printf(USAGE_MAN_TAIL("lsfd(1)"));
 
 	exit(EXIT_SUCCESS);
+}
+
+static void xstrappend(char **a, const char *b)
+{
+	if (strappend(a, b) < 0)
+		err(EXIT_FAILURE, _("failed to allocate memory for string"));
+}
+
+static char * quote_filter_expr(char *expr)
+{
+	char c[] = {'\0', '\0'};
+	char *r = strdup("");
+	while (*expr) {
+		switch (*expr) {
+		case '\'':
+			xstrappend(&r, "\\'");
+			break;
+		case '"':
+			xstrappend(&r, "\\\"");
+			break;
+		default:
+			c[0] = *expr;
+			xstrappend(&r, c);
+			break;
+		}
+		expr++;
+	}
+	return r;
+}
+
+static void append_filter_expr(char **a, const char *b, bool and)
+{
+	if (*a == NULL) {
+		*a = xstrdup(b);
+		return;
+	}
+
+	char *tmp = *a;
+	*a = NULL;
+
+	xstrappend(a, "(");
+	xstrappend(a, tmp);
+	xstrappend(a, ")");
+	if (and)
+		xstrappend(a, "and(");
+	else
+		xstrappend(a, "or(");
+	xstrappend(a, b);
+	xstrappend(a, ")");
 }
 
 int main(int argc, char *argv[])
@@ -922,9 +1021,11 @@ int main(int argc, char *argv[])
 	size_t i;
 	char *outarg = NULL;
 	struct lsfd_control ctl = {};
+	char  *filter_expr = NULL;
 
 	enum {
-		OPT_SYSROOT = CHAR_MAX + 1
+		OPT_SYSROOT = CHAR_MAX + 1,
+		OPT_SOURCE,
 	};
 	static const struct option longopts[] = {
 		{ "noheadings", no_argument, NULL, 'n' },
@@ -936,6 +1037,8 @@ int main(int argc, char *argv[])
 		{ "threads",    no_argument, NULL, 'l' },
 		{ "notruncate", no_argument, NULL, 'u' },
 		{ "sysroot",    required_argument, NULL, OPT_SYSROOT },
+		{ "filter",     required_argument, NULL, 'Q' },
+		{ "source",     required_argument, NULL, OPT_SOURCE },
 		{ NULL, 0, NULL, 0 },
 	};
 
@@ -944,7 +1047,7 @@ int main(int argc, char *argv[])
 	textdomain(PACKAGE);
 	close_stdout_atexit();
 
-	while ((c = getopt_long(argc, argv, "no:JrVhlu", longopts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "no:JrVhluQ:", longopts, NULL)) != -1) {
 		switch (c) {
 		case 'n':
 			ctl.noheadings = 1;
@@ -967,6 +1070,20 @@ int main(int argc, char *argv[])
 		case OPT_SYSROOT:
 			ctl.sysroot = optarg;
 			break;
+		case 'Q':
+			append_filter_expr(&filter_expr, optarg, true);
+			break;
+		case OPT_SOURCE: {
+			char * quoted_source = quote_filter_expr(optarg);
+			char * source_expr = NULL;
+			xstrappend(&source_expr, "(SOURCE == '");
+			xstrappend(&source_expr, quoted_source);
+			xstrappend(&source_expr, "')");
+			append_filter_expr(&filter_expr, source_expr, true);
+			free(source_expr);
+			free(quoted_source);
+			break;
+		}
 
 		case 'V':
 			print_version(EXIT_SUCCESS);
@@ -1009,17 +1126,28 @@ int main(int argc, char *argv[])
 	/* create output columns */
 	for (i = 0; i < ncolumns; i++) {
 		const struct colinfo *col = get_column_info(i);
-		struct libscols_column *cl;
-		int flags = col->flags;
+		struct libscols_column *cl = add_column(ctl.tb, col);
 
-		if (ctl.notrunc)
-			flags &= ~SCOLS_FL_TRUNC;
-		cl = scols_table_new_column(ctl.tb, col->name, col->whint, flags);
 		if (!cl)
 			err(EXIT_FAILURE, _("failed to allocate output column"));
 
-		if (ctl.json)
-			scols_column_set_json_type(cl, col->json_type);
+		if (ctl.notrunc) {
+			int flags = scols_column_get_flags(cl);
+			flags &= ~SCOLS_FL_TRUNC;
+			scols_column_set_flags(cl, flags);
+		}
+	}
+
+	/* make fitler */
+	if (filter_expr) {
+		ctl.filter = lsfd_filter_new(filter_expr, ctl.tb,
+					     LSFD_N_COLS,
+					     column_name_to_id_cb,
+					     add_column_by_id_cb, &ctl);
+		const char *errmsg = lsfd_filter_get_errmsg(ctl.filter);
+		if (errmsg)
+			errx(EXIT_FAILURE, "%s", errmsg);
+		free(filter_expr);
 	}
 
 	/* collect data */
@@ -1031,7 +1159,7 @@ int main(int argc, char *argv[])
 	convert(&ctl.procs, &ctl);
 	emit(&ctl);
 
-	/* cleabup */
+	/* cleanup */
 	delete(&ctl.procs, &ctl);
 
 	finalize_classes();
