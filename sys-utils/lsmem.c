@@ -498,7 +498,8 @@ static void read_basic_info(struct lsmem *lsmem)
 
 	ul_path_get_abspath(lsmem->sysmem, dir, sizeof(dir), NULL);
 
-	lsmem->ndirs = scandir(dir, &lsmem->dirs, memory_block_filter, versionsort);
+	//lsmem->ndirs = scandir(dir, &lsmem->dirs, memory_block_filter, versionsort);
+	lsmem->ndirs = scandir(dir, &lsmem->dirs, memory_block_filter, alphasort);
 	if (lsmem->ndirs <= 0)
 		err(EXIT_FAILURE, _("Failed to read %s"), dir);
 
