@@ -851,7 +851,8 @@ static int __mnt_table_parse_dir(struct libmnt_table *tb, const char *dirname)
 	if (dd < 0)
 	        return -errno;
 
-	n = scandirat(dd, ".", &namelist, mnt_table_parse_dir_filter, versionsort);
+	//n = scandirat(dd, ".", &namelist, mnt_table_parse_dir_filter, versionsort);
+	n = scandirat(dd, ".", &namelist, mnt_table_parse_dir_filter, alphasort);
 	if (n <= 0) {
 	        close(dd);
 	        return 0;
@@ -886,7 +887,8 @@ static int __mnt_table_parse_dir(struct libmnt_table *tb, const char *dirname)
 	DIR *dir = NULL;
 	struct dirent **namelist = NULL;
 
-	n = scandir(dirname, &namelist, mnt_table_parse_dir_filter, versionsort);
+	//n = scandir(dirname, &namelist, mnt_table_parse_dir_filter, versionsort);
+	n = scandir(dirname, &namelist, mnt_table_parse_dir_filter, alphasort);
 	if (n <= 0)
 		return 0;
 
